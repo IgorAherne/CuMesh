@@ -1,10 +1,12 @@
 To build a whl for Trellis do:
 
 - open the `x64 Native Tools Command Prompt`
-- navigate to the folder of Trellis and activate its `.venv`
-- confirm that venv already has pytorch 2.8 installed
+- navigate to the folder of Trellis and activate its `.venv`.
+- confirm that venv already has pytorch 2.8 installed inside the venv.
 - install the wheel: `pip install wheel`
 - confirm your python version is 3.11 (`python --version`)
+- jump back to this CuMesh repo folder.
+- pull additional dependencies `git submodule update --init --recursive`
 - point towards your cuda toolkit (watchout for the number at the end) `set CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
 - and also do `set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;%PATH%`
 - make it work with older cards (GTX 980) and newer ones, including RTX 5090: `set TORCH_CUDA_ARCH_LIST=5.2 6.1 7.5 8.0 8.6 8.9 9.0+PTX`
