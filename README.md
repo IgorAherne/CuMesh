@@ -8,7 +8,7 @@ To build a whl for Trellis do:
 - jump back to this CuMesh repo folder.
 - pull additional dependencies `git submodule update --init --recursive`
 - point towards your cuda toolkit (watchout for the number at the end) `set CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
-- and also do `set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;%PATH%`
+- and also do (watchout for the number at the end) `set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;%PATH%`
 - make it work with older cards (GTX 980) and newer ones, including RTX 5090: `set TORCH_CUDA_ARCH_LIST=5.2 6.1 7.5 8.0 8.6 8.9 9.0+PTX`
 - also toggle this: `set DISTUTILS_USE_SDK=1`
 - build the wheel `pip wheel . --no-build-isolation -w dist`
