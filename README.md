@@ -1,3 +1,19 @@
+To build a whl for Trellis do:
+
+- open the `x64 Native Tools Command Prompt`
+- navigate to the folder of Trellis and activate its `.venv`
+- confirm that venv already has pytorch 2.8 installed
+- install the wheel: `pip install wheel`
+- confirm your python version is 3.11 (`python --version`)
+- point towards your cuda toolkit (watchout for the number at the end) `set CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
+- and also do `set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;%PATH%`
+- make it work with older cards (GTX 980) and newer ones, including RTX 5090: `set TORCH_CUDA_ARCH_LIST=5.2 6.1 7.5 8.0 8.6 8.9 9.0+PTX`
+- also toggle this: `set DISTUTILS_USE_SDK=1`
+- build the wheel `pip wheel . --no-build-isolation -w dist`
+- you now will have your `.whl` file inside `dist` folder. Users can install it via `pip install` and it will work on the gpu cards specified above.
+
+Original repo description:
+
 # CuMesh: High-Performance Geometry Processing for PyTorch
 
 **CuMesh** is a GPU-accelerated library designed for high-performance 3D geometry processing directly within the PyTorch ecosystem. It provides efficient primitives for mesh cleaning, decimation, remeshing, and UV unwrapping.
