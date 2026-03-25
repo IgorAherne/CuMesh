@@ -115,29 +115,61 @@ def remesh_narrow_band_dc(
     pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_resolution)).item()) + 1, 
                 desc="Building Sparse Grid", disable=not verbose)
 
-    while True:
-        # Calculate UDF for current voxels
-        cell_size = scale / base_resolution
-        pts = ((coords.float() + 0.5) / base_resolution - 0.5) * scale + center
-        
-        distances = bvh.unsigned_distance(pts)[0]
-        distances -= eps
-        distances = torch.abs(distances) # Keep positive for refinement check
-        
-        # Determine which voxels are near the surface (Narrow Band)
-        # 0.87 is approx sqrt(3)/2, covering the diagonal radius of a voxel
-        subdiv_mask = distances < 0.87 * cell_size
-        coords = coords[subdiv_mask]
+    BVH_CHUNK = 2_000_000  # Max points per BVH query
 
-        if base_resolution >= resolution:
-            break
-            
-        # Subdivide
+    def _chunked_bvh_udf(bvh, pts):
+        """Run BVH unsigned_distance in chunks to limit internal buffer peak."""
+        if pts.shape[0] <= BVH_CHUNK:
+            return bvh.unsigned_distance(pts)[0]
+        out = torch.empty(pts.shape[0], device=pts.device, dtype=torch.float32)
+        for j in range(0, pts.shape[0], BVH_CHUNK):
+            out[j:j+BVH_CHUNK] = bvh.unsigned_distance(pts[j:j+BVH_CHUNK])[0]
+        return out
+
+    # --- First iteration: filter the initial coarse grid ---
+    cell_size = scale / base_resolution
+    pts = ((coords.float() + 0.5) / base_resolution - 0.5) * scale + center
+    distances = _chunked_bvh_udf(bvh, pts)
+    del pts
+    distances -= eps
+    distances = torch.abs(distances)
+    subdiv_mask = distances < 0.87 * cell_size
+    del distances
+    coords = coords[subdiv_mask]
+    del subdiv_mask
+    pbar.update(1)
+
+    # --- Subsequent iterations: fused expand + filter in chunks ---
+    # Instead of expanding ALL parents to 8× children (memory bomb),
+    # process PARENT_CHUNK parents at a time: expand → BVH → filter → keep.
+    # Caps peak at PARENT_CHUNK*8 coords instead of N_parents*8.
+    PARENT_CHUNK = 500_000  # 500K parents → 4M children → ~112MB peak per chunk
+
+    while base_resolution < resolution:
         base_resolution *= 2
-        coords *= 2
-        # Expand 1 voxel to 8 children
-        coords = coords.unsqueeze(1) + OFFSETS.unsqueeze(0) # (N, 8, 3)
-        coords = coords.reshape(-1, 3)
+        cell_size = scale / base_resolution
+        coords_doubled = coords * 2
+        del coords
+        torch.cuda.empty_cache()
+
+        surviving = []
+        for i in range(0, coords_doubled.shape[0], PARENT_CHUNK):
+            chunk_parents = coords_doubled[i:i+PARENT_CHUNK]
+            children = (chunk_parents.unsqueeze(1) + OFFSETS.unsqueeze(0)).reshape(-1, 3)
+            pts = ((children.float() + 0.5) / base_resolution - 0.5) * scale + center
+            dists = _chunked_bvh_udf(bvh, pts)
+            del pts
+            dists -= eps
+            dists = dists.abs()
+            mask = dists < 0.87 * cell_size
+            del dists
+            surviving.append(children[mask])
+            del children, mask
+        del coords_doubled
+        torch.cuda.empty_cache()
+
+        coords = torch.cat(surviving, dim=0)
+        del surviving
         pbar.update(1)
 
     # -------------------------------------------------------------------------
@@ -160,7 +192,14 @@ def remesh_narrow_band_dc(
     # 4.3 Compute Values (SDF/UDF) at Grid Vertices
     # Note: We shift the surface by `eps` so the isosurface is at 0.
     pts_vert = (grid_verts.float() / resolution - 0.5) * scale + center
-    distances_vert = bvh.unsigned_distance(pts_vert)[0]
+    BVH_CHUNK = 2_000_000
+    if pts_vert.shape[0] <= BVH_CHUNK:
+        distances_vert = bvh.unsigned_distance(pts_vert)[0]
+    else:
+        distances_vert = torch.empty(pts_vert.shape[0], device=device, dtype=torch.float32)
+        for i in range(0, pts_vert.shape[0], BVH_CHUNK):
+            distances_vert[i:i+BVH_CHUNK] = bvh.unsigned_distance(pts_vert[i:i+BVH_CHUNK])[0]
+    del pts_vert
     distances_vert -= eps 
     # distances_vert is now "Signed" Distance where < 0 is inside the band, > 0 is outside.
     
@@ -184,22 +223,30 @@ def remesh_narrow_band_dc(
         *hashmap_vert, coords, distances_vert, resolution + 1, resolution + 1, resolution + 1
     )
     
+    # Free data only needed for dual contouring
+    del hashmap_vert, distances_vert, grid_verts
+    torch.cuda.empty_cache()
+    
     # -------------------------------------------------------------------------
     # 6. Topology Generation (Connectivity)
     # -------------------------------------------------------------------------
     # Find connected voxels
     edge_neighbor_voxel = coords.reshape(Nvox, 1, 1, 3) + remesh_narrow_band_dc.edge_neighbor_voxel_offset      # (N, 3, 4, 3)
     connected_voxel = edge_neighbor_voxel[intersected != 0]                           # (M, 4, 3)
+    del edge_neighbor_voxel
     intersected = intersected[intersected != 0]                                       # (M,)
     M = connected_voxel.shape[0]
     connected_voxel_hash_key = torch.cat([
         torch.zeros((M * 4, 1), dtype=torch.int, device=coords.device),
         connected_voxel.reshape(-1, 3)
     ], dim=1)
+    del connected_voxel
     connected_voxel_indices = _C.hashmap_lookup_3d_cuda(*hashmap_vox, connected_voxel_hash_key, resolution, resolution, resolution).reshape(M, 4).int()
+    del connected_voxel_hash_key, hashmap_vox
     connected_voxel_valid = (connected_voxel_indices != 0xffffffff).all(dim=1)
     quad_indices = connected_voxel_indices[connected_voxel_valid].int()                             # (L, 4)
     intersected_dir = intersected[connected_voxel_valid].int()
+    del connected_voxel_indices, connected_voxel_valid
     L = quad_indices.shape[0]
     
     # Remove unreferenced vertices

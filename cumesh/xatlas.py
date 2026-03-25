@@ -2,7 +2,7 @@ import torch
 from typing import *
 from tqdm import tqdm
 
-from . import _cumesh_xatlas as _xatlas
+from . import _xatlas
 
 class Atlas:
     def __init__(self):
