@@ -123,46 +123,78 @@ static __global__ void expand_edges_kernel(
 void CuMesh::get_edges() {
     cudaStream_t stream = current_stream();
     size_t F = this->faces.size;
-    this->edges.resize(F * 3);
-    expand_edges_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->faces.ptr, F, this->edges.ptr);
+
+    // Spellcast3D: the same edges and counts as upstream, bit for bit, in far less card memory. Upstream
+    // expands the 3F edge keys into `edges`, sorts them into `temp_storage` with cub's out-of-place sort
+    // (which takes a third buffer of 3F keys inside cub_temp_storage), encodes the runs back into `edges` and
+    // their lengths into a 3F-int `edge2face_cnt`, and keeps all four at their 3F sizes until clear_cache():
+    // 72 bytes a face during the sort, 84 held after it. Here the keys are sorted in a DoubleBuffer of two 3F
+    // buffers (cub sorts back and forth between them instead of taking a third), the one that does not hold
+    // the result is freed at once, the runs are counted first (the same encoding with its outputs discarded)
+    // so that `edges` and `edge2face_cnt` get exactly E entries, and the sorted keys and cub's scratch are
+    // freed before the return: 48 bytes a face during the sort, 12 E (about 18 a face) held after it. A sort
+    // of keys alone has one result whatever the sort (the keys in ascending order), and the encoding reads
+    // the same sorted keys. The stream is synchronised before a buffer that queued work reads is freed.
+    uint64_t *cu_keys, *cu_keys_alt;
+    CUDA_CHECK(cudaMalloc(&cu_keys, F * 3 * sizeof(uint64_t)));
+    expand_edges_kernel<<<(F+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(this->faces.ptr, F, cu_keys);
     CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMalloc(&cu_keys_alt, F * 3 * sizeof(uint64_t)));
 
     // sort edges
-    this->temp_storage.resize(F * 3 * sizeof(uint64_t));
+    cub::DoubleBuffer<uint64_t> keys(cu_keys, cu_keys_alt);
     size_t temp_storage_bytes = 0;
     CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
         nullptr, temp_storage_bytes,
-        this->edges.ptr,
-        reinterpret_cast<uint64_t*>(this->temp_storage.ptr),
+        keys,
         F * 3, 0, sizeof(uint64_t) * 8, stream
     ));
     this->cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceRadixSort::SortKeys(
         this->cub_temp_storage.ptr, temp_storage_bytes,
-        this->edges.ptr,
-        reinterpret_cast<uint64_t*>(this->temp_storage.ptr),
+        keys,
         F * 3, 0, sizeof(uint64_t) * 8, stream
     ));
+    uint64_t* cu_sorted = keys.Current();
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    CUDA_CHECK(cudaFree(keys.Alternate()));
 
-    // unique edges
+    // unique edges: counted first, then encoded into tables of exactly that length
     int* num_edges;
     CUDA_CHECK(cudaMalloc(&num_edges, sizeof(int)));
-    this->edge2face_cnt.resize(F * 3);
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         nullptr, temp_storage_bytes,
-        reinterpret_cast<uint64_t*>(this->temp_storage.ptr), this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
+        cu_sorted, cub::DiscardOutputIterator<>(), cub::DiscardOutputIterator<>(), num_edges,
         F * 3, stream
     ));
     this->cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
         this->cub_temp_storage.ptr, temp_storage_bytes,
-        reinterpret_cast<uint64_t*>(this->temp_storage.ptr), this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
+        cu_sorted, cub::DiscardOutputIterator<>(), cub::DiscardOutputIterator<>(), num_edges,
         F * 3, stream
     ));
-    CUDA_CHECK(cudaMemcpyAsync(&this->edges.size, num_edges, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    int E;
+    CUDA_CHECK(cudaMemcpyAsync(&E, num_edges, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
-    this->edge2face_cnt.size = this->edges.size;
+    this->edges.free();
+    this->edges.resize(E);
+    this->edge2face_cnt.free();
+    this->edge2face_cnt.resize(E);
+    CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
+        nullptr, temp_storage_bytes,
+        cu_sorted, this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
+        F * 3, stream
+    ));
+    this->cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceRunLengthEncode::Encode(
+        this->cub_temp_storage.ptr, temp_storage_bytes,
+        cu_sorted, this->edges.ptr, this->edge2face_cnt.ptr, num_edges,
+        F * 3, stream
+    ));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(num_edges));
+    CUDA_CHECK(cudaFree(cu_sorted));
+    this->cub_temp_storage.free();
 }
 
 
@@ -422,13 +454,34 @@ void CuMesh::get_boundary_info() {
     size_t E = this->edges.size;
 
     // Select boundary edges
+    // Spellcast3D: the edge indices come from a counting iterator instead of an arange table of E ints, and the
+    // boundary edges are counted first (the same selection with its output discarded) so that `boundaries`
+    // gets exactly B entries instead of E: the same indices in the same order (the selection keeps the input
+    // order), 8 bytes an edge less on the card during the call and 4 an edge less held after it.
     size_t temp_storage_bytes = 0;
-    int *cu_num_boundary, *cu_edge_idx;
+    int *cu_num_boundary;
     CUDA_CHECK(cudaMalloc(&cu_num_boundary, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_edge_idx, E * sizeof(int)));
-    this->boundaries.resize(E);
-    arange_kernel<<<(E+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_edge_idx, E);
-    CUDA_CHECK(cudaGetLastError());
+    cub::CountingInputIterator<int> cu_edge_idx(0);
+    CUDA_CHECK(cub::DeviceSelect::If(
+        nullptr, temp_storage_bytes,
+        cu_edge_idx, cub::DiscardOutputIterator<>(), cu_num_boundary,
+        E,
+        is_boundary_edge{this->edge2face_cnt.ptr},
+        stream
+    ));
+    this->cub_temp_storage.resize(temp_storage_bytes);
+    CUDA_CHECK(cub::DeviceSelect::If(
+        this->cub_temp_storage.ptr, temp_storage_bytes,
+        cu_edge_idx, cub::DiscardOutputIterator<>(), cu_num_boundary,
+        E,
+        is_boundary_edge{this->edge2face_cnt.ptr},
+        stream
+    ));
+    int num_boundaries;
+    CUDA_CHECK(cudaMemcpyAsync(&num_boundaries, cu_num_boundary, sizeof(int), cudaMemcpyDeviceToHost, stream));
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    this->boundaries.free();
+    this->boundaries.resize(num_boundaries);
     CUDA_CHECK(cub::DeviceSelect::If(
         nullptr, temp_storage_bytes,
         cu_edge_idx, this->boundaries.ptr, cu_num_boundary,
@@ -444,10 +497,8 @@ void CuMesh::get_boundary_info() {
         is_boundary_edge{this->edge2face_cnt.ptr},
         stream
     ));
-    CUDA_CHECK(cudaMemcpyAsync(&this->boundaries.size, cu_num_boundary, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
     CUDA_CHECK(cudaFree(cu_num_boundary));
-    CUDA_CHECK(cudaFree(cu_edge_idx));
 
     // Set vertex boundary indicator
     this->vert_is_boundary.resize(this->vertices.size);
@@ -766,16 +817,17 @@ void CuMesh::get_manifold_boundary_adjacency() {
     size_t V = this->vertices.size;
 
     // Select manifold boundary vertices
+    // Spellcast3D: the vertex indices come from a counting iterator instead of an arange table of V ints, and
+    // the selected vertices are counted first (the same selection with its output discarded) so that their
+    // list gets exactly as many entries as there are instead of V: the same indices in the same order (the
+    // selection keeps the input order), 8 bytes a vertex less on the card during the call.
     size_t temp_storage_bytes = 0;
-    int *cu_num_manifold_boundary_verts, *cu_vert_idx, *cu_manifold_vert_idx;
+    int *cu_num_manifold_boundary_verts, *cu_manifold_vert_idx = nullptr;
     CUDA_CHECK(cudaMalloc(&cu_num_manifold_boundary_verts, sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_vert_idx, V * sizeof(int)));
-    CUDA_CHECK(cudaMalloc(&cu_manifold_vert_idx, V * sizeof(int)));
-    arange_kernel<<<(V+BLOCK_SIZE-1)/BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(cu_vert_idx, V);
-    CUDA_CHECK(cudaGetLastError());
+    cub::CountingInputIterator<int> cu_vert_idx(0);
     CUDA_CHECK(cub::DeviceSelect::If(
         nullptr, temp_storage_bytes,
-        cu_vert_idx, cu_manifold_vert_idx, cu_num_manifold_boundary_verts,
+        cu_vert_idx, cub::DiscardOutputIterator<>(), cu_num_manifold_boundary_verts,
         V,
         is_manifold_boundary_vertex{this->vert_is_manifold.ptr, this->vert_is_boundary.ptr},
         stream
@@ -783,7 +835,7 @@ void CuMesh::get_manifold_boundary_adjacency() {
     this->cub_temp_storage.resize(temp_storage_bytes);
     CUDA_CHECK(cub::DeviceSelect::If(
         this->cub_temp_storage.ptr, temp_storage_bytes,
-        cu_vert_idx, cu_manifold_vert_idx, cu_num_manifold_boundary_verts,
+        cu_vert_idx, cub::DiscardOutputIterator<>(), cu_num_manifold_boundary_verts,
         V,
         is_manifold_boundary_vertex{this->vert_is_manifold.ptr, this->vert_is_boundary.ptr},
         stream
@@ -791,8 +843,26 @@ void CuMesh::get_manifold_boundary_adjacency() {
     int manifold_boundary_vert_count;
     CUDA_CHECK(cudaMemcpyAsync(&manifold_boundary_vert_count, cu_num_manifold_boundary_verts, sizeof(int), cudaMemcpyDeviceToHost, stream));
     CUDA_CHECK(cudaStreamSynchronize(stream));
+    if (manifold_boundary_vert_count > 0) {
+        CUDA_CHECK(cudaMalloc(&cu_manifold_vert_idx, manifold_boundary_vert_count * sizeof(int)));
+        CUDA_CHECK(cub::DeviceSelect::If(
+            nullptr, temp_storage_bytes,
+            cu_vert_idx, cu_manifold_vert_idx, cu_num_manifold_boundary_verts,
+            V,
+            is_manifold_boundary_vertex{this->vert_is_manifold.ptr, this->vert_is_boundary.ptr},
+            stream
+        ));
+        this->cub_temp_storage.resize(temp_storage_bytes);
+        CUDA_CHECK(cub::DeviceSelect::If(
+            this->cub_temp_storage.ptr, temp_storage_bytes,
+            cu_vert_idx, cu_manifold_vert_idx, cu_num_manifold_boundary_verts,
+            V,
+            is_manifold_boundary_vertex{this->vert_is_manifold.ptr, this->vert_is_boundary.ptr},
+            stream
+        ));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+    }
     CUDA_CHECK(cudaFree(cu_num_manifold_boundary_verts));
-    CUDA_CHECK(cudaFree(cu_vert_idx));
 
     // Early return if no manifold boundary vertices
     if (manifold_boundary_vert_count == 0) {

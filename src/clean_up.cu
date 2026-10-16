@@ -681,6 +681,20 @@ void CuMesh::fill_holes(float max_hole_perimeter) {
     );
     CUDA_CHECK(cudaGetLastError());
 
+    // Spellcast3D: the connectivity tables (edge counts, the vertex-edge and vertex-boundary lists, the flags,
+    // the boundary components and loops) and cub's scratch are not read again here - the update below needs
+    // the edges and this function's own lists only - and upstream frees all of them with clear_cache() right
+    // after it. They are freed before the vertex and face buffers are extended (an extension holds the old and
+    // the new buffer for a moment), so the update's widest moment is the mesh and the edges alone (each free
+    // synchronises the stream first). The edges go with clear_cache() below, as upstream: the object ends as
+    // upstream leaves it.
+    {
+        Buffer<uint64_t> kept_edges = this->edges;
+        this->edges = Buffer<uint64_t>();
+        this->clear_cache();
+        this->edges = kept_edges;
+    }
+
     // Update mesh
     this->vertices.extend(new_num_bound_loops);
     this->faces.extend(new_num_loop_boundaries);
