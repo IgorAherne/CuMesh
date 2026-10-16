@@ -1,4 +1,3 @@
-#include "cumesh_msvc_compat.h"
 #include <torch/extension.h>
 #include "hash/api.h"
 #include "cumesh.h"
