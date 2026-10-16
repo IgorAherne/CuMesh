@@ -1,4 +1,3 @@
-[submodule "third_party/cubvh"]
-	path = third_party/cubvh
-	url = https://github.com/JeffreyXiang/cubvh.git
-	branch = trellis.2
+[submodule "third_party/cubvh/third_party/eigen"]
+	path = third_party/cubvh/third_party/eigen
+	url = https://gitlab.com/libeigen/eigen
