@@ -19,7 +19,10 @@ py::class_<cuBVH>(m, "cuBVH")
     .def("unsigned_distance", &cuBVH::unsigned_distance)
     .def("signed_distance", &cuBVH::signed_distance);
 
-m.def("create_cuBVH", &create_cuBVH);
+// The tree is built on the CPU for seconds and touches no Python object (its arguments are Eigen matrices
+// pybind converted before the call): without the GIL, other Python threads run meanwhile (Spellcast3D
+// builds a prop's BVH on a worker thread while its GPU thread decodes the next prop).
+m.def("create_cuBVH", &create_cuBVH, py::call_guard<py::gil_scoped_release>());
 
 m.def("floodfill", &floodfill);
 
