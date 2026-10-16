@@ -405,6 +405,108 @@ public:
         return {res.first, std::copysignf(res.second, avg_normal.dot(point - closest_point))};
     }
 
+    // Spellcast3D: whether a ray hits the mesh at all - all that signed_distance_raystab asks of a stab ray,
+    // where ray_intersect (the closest-hit traversal above) goes on searching for the nearest hit after its
+    // first one. The answer is ray_intersect(ro, rd, ...).first >= 0 for every ray, by construction:
+    //  - a triangle counts when Triangle::ray_intersect gives t < MAX_DIST, which is how ray_intersect takes
+    //    its first hit (t < mint, and mint is MAX_DIST until then): the same function of the same arguments
+    //    and the same comparison;
+    //  - a child is left out when its box's entry distance (BoundingBox::ray_intersect(...).x()) is not below
+    //    MAX_DIST, which is what ray_intersect leaves out until its first hit (it pushes a child when that
+    //    distance is below mint); only after a first hit, when its answer is settled, does it leave out more;
+    //  - so both answer "some leaf whose box has an entry distance below MAX_DIST holds a triangle with t below
+    //    MAX_DIST", whatever the order of the visit: a box holds its descendants' boxes (min and max over the
+    //    same vertex floats) and the slab test is monotone in the box (IEEE subtraction and division, no
+    //    contraction possible), so every ancestor of such a leaf, the root included, has an entry distance no
+    //    larger than the leaf's. The same holds for the escape-link traversals that both fall back to after a
+    //    stack overflow (they test the root too, the stack traversals do not).
+    // Only the order of the visit changes, for speed: children whose box lies wholly behind the ray's origin
+    // (exit distance below 0) come after their siblings, which come by entry distance as in ray_intersect, so
+    // that a ray from inside the mesh meets the surface ahead of it before it walks the boxes behind it.
+    __host__ __device__ static bool ray_intersect_any_stackless(Ref<const Vector3f> ro, Ref<const Vector3f> rd, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
+        int idx = 0;
+        while (idx != -1) {
+            const TriangleBvhNode& node = bvhnodes[idx];
+
+            float tbb = node.bb.ray_intersect(ro, rd).x();
+            if (tbb >= MAX_DIST) {
+                idx = node.escape_idx;
+                continue;
+            }
+
+            if (node.left_idx < 0) {
+                int end = -node.right_idx-1;
+                for (int i = -node.left_idx-1; i < end; ++i) {
+                    float t = triangles[i].ray_intersect(ro, rd);
+                    if (t < MAX_DIST) {
+                        return true;
+                    }
+                }
+                idx = node.escape_idx;
+            } else {
+                idx = node.left_idx;
+            }
+        }
+
+        return false;
+    }
+
+    __host__ __device__ static bool ray_intersect_any(Ref<const Vector3f> ro, Ref<const Vector3f> rd, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles) {
+        FixedIntStack query_stack;
+        query_stack.push(0);
+
+        while (!query_stack.empty()) {
+            int idx = query_stack.pop();
+
+            const TriangleBvhNode& node = bvhnodes[idx];
+
+            if (node.left_idx < 0) {
+                int end = -node.right_idx-1;
+                for (int i = -node.left_idx-1; i < end; ++i) {
+                    float t = triangles[i].ray_intersect(ro, rd);
+                    if (t < MAX_DIST) {
+                        return true;
+                    }
+                }
+            } else {
+                DistAndIdx children[BRANCHING_FACTOR];
+
+                uint32_t first_child = node.left_idx;
+
+                #pragma unroll
+                for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+                    Vector2f span = bvhnodes[i+first_child].bb.ray_intersect(ro, rd);
+                    // The sort key: the entry distance; MAX_DIST (after every other child) for a box wholly
+                    // behind the origin; infinity (never pushed) for a box ray_intersect leaves out before
+                    // its first hit. So a child is pushed exactly when its entry distance is below MAX_DIST.
+                    float key = span.x();
+                    if (!(span.x() < MAX_DIST)) {
+                        key = std::numeric_limits<float>::infinity();
+                    } else if (span.y() < 0.0f) {
+                        key = MAX_DIST;
+                    }
+                    children[i] = {key, i+first_child};
+                }
+
+                sorting_network<BRANCHING_FACTOR>(children);
+
+                #pragma unroll
+                for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+                    if (children[i].dist <= MAX_DIST) {
+                        query_stack.push(children[i].idx);
+                    }
+                }
+            }
+
+            if (query_stack.overflowed()) {
+                // Fallback to stackless traversal to guarantee correctness
+                return ray_intersect_any_stackless(ro, rd, bvhnodes, triangles);
+            }
+        }
+
+        return false;
+    }
+
     __host__ __device__ static std::pair<int, float> signed_distance_raystab(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, float max_distance_sq = MAX_DIST_SQ, pcg32 rng={}) {
         auto res = closest_triangle(point, bvhnodes, triangles, max_distance_sq);
 
@@ -418,7 +520,9 @@ public:
             Vector3f d = fibonacci_dir<N_STAB_RAYS>(i, offset);
 
             // If any of the stab rays goes outside the mesh, the SDF is positive.
-            if (ray_intersect(point, -d, bvhnodes, triangles).first < 0 || ray_intersect(point, d, bvhnodes, triangles).first < 0) {
+            // Spellcast3D: only hit or no hit counts here, so ray_intersect_any, which stops at the first hit
+            // (the same answer as ray_intersect(...).first >= 0, see above).
+            if (!ray_intersect_any(point, -d, bvhnodes, triangles) || !ray_intersect_any(point, d, bvhnodes, triangles)) {
                 return {res.first, res.second};
             }
         }
