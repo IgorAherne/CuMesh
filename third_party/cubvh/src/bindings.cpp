@@ -17,12 +17,19 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 py::class_<cuBVH>(m, "cuBVH")
     .def("ray_trace", &cuBVH::ray_trace)
     .def("unsigned_distance", &cuBVH::unsigned_distance)
-    .def("signed_distance", &cuBVH::signed_distance);
+    .def("signed_distance", &cuBVH::signed_distance)
+    // Spellcast3D: the card copy on demand. upload and release_device touch no Python object; without the
+    // GIL other threads run while the copy is made or while cudaFree waits for queued kernels.
+    .def("upload", &cuBVH::upload, py::call_guard<py::gil_scoped_release>())
+    .def("release_device", &cuBVH::release_device, py::call_guard<py::gil_scoped_release>())
+    .def_property_readonly("on_device", &cuBVH::is_on_device);
 
 // The tree is built on the CPU for seconds and touches no Python object (its arguments are Eigen matrices
 // pybind converted before the call): without the GIL, other Python threads run meanwhile (Spellcast3D
 // builds a prop's BVH on a worker thread while its GPU thread decodes the next prop).
-m.def("create_cuBVH", &create_cuBVH, py::call_guard<py::gil_scoped_release>());
+// upload=False builds the tree on the CPU only and leaves the card alone (upload() or the first query copies it).
+m.def("create_cuBVH", &create_cuBVH, py::arg("vertices"), py::arg("triangles"), py::arg("upload") = true,
+      py::call_guard<py::gil_scoped_release>());
 
 m.def("floodfill", &floodfill);
 

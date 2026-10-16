@@ -81,6 +81,19 @@ public:
         return m_nodes_gpu.data();
     }
 
+    // Spellcast3D: build() fills the host vector m_nodes only. upload() copies it to the card and
+    // release_device() frees the card copy but keeps m_nodes, so the tree can go back to the card later
+    // without being built again.
+    virtual void upload() {
+        m_nodes_gpu.resize_and_copy_from_host(m_nodes);
+    }
+
+    // resize(0) rather than free_memory(): free_memory() keeps the element count, and a later resize to the
+    // same count would then skip the allocation and copy into a null pointer.
+    virtual void release_device() {
+        m_nodes_gpu.resize(0);
+    }
+
 };
 
 } // namespace cubvh

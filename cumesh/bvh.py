@@ -9,9 +9,11 @@ _sdf_mode_to_id = {
 }
 
 class cuBVH():
-    def __init__(self, vertices, triangles):
+    def __init__(self, vertices, triangles, upload=True):
         # vertices: np.ndarray, [N, 3]
         # triangles: np.ndarray, [M, 3]
+        # upload: copy the tree to the card now, as upstream does. Spellcast3D passes False to build it on
+        # the CPU only, on a worker thread, without taking card memory; upload() or the first query copies it.
 
         if torch.is_tensor(vertices): vertices = vertices.detach().cpu().numpy()
         if torch.is_tensor(triangles): triangles = triangles.detach().cpu().numpy()
@@ -20,7 +22,20 @@ class cuBVH():
         assert triangles.shape[0] > 8, "BVH needs at least 8 triangles."
         
         # implementation
-        self.impl = _backend.create_cuBVH(vertices, triangles)
+        self.impl = _backend.create_cuBVH(vertices, triangles, bool(upload))
+
+    def upload(self):
+        # Copies the tree (nodes and triangles) to the card when it is not there, without Python's lock so
+        # other threads run meanwhile. The queries do it themselves when needed (holding the lock).
+        self.impl.upload()
+
+    def release_device(self):
+        # Frees the card copy and keeps the host copy, so a later upload() or query needs no rebuild.
+        self.impl.release_device()
+
+    @property
+    def on_device(self):
+        return self.impl.on_device
 
     def ray_trace(self, rays_o, rays_d):
         # rays_o: torch.Tensor, float, [N, 3]

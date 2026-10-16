@@ -23,10 +23,18 @@ public:
     virtual void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) = 0;
     virtual void unsigned_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw) = 0;
     virtual void signed_distance(at::Tensor positions, at::Tensor distances, at::Tensor face_id, at::optional<at::Tensor> uvw, uint32_t mode) = 0;
+
+    // Spellcast3D: the card copy of the tree (nodes and triangles) on demand. upload() makes it when it is
+    // not there; release_device() frees it and keeps the host copy, so a later upload needs no rebuild; the
+    // three queries above upload first when the copy is not there.
+    virtual void upload() = 0;
+    virtual void release_device() = 0;
+    virtual bool is_on_device() = 0;
 };
 
-// function to create an implementation of cuBVH
-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles);
+// function to create an implementation of cuBVH. Spellcast3D: with upload false the tree is built on the
+// CPU and no CUDA call is made at all, so a worker thread can build it while the GPU thread works.
+cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles, bool upload = true);
 // floodfill
 at::Tensor floodfill(at::Tensor grid);
 

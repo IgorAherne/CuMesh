@@ -7,6 +7,8 @@
 
 #include <Eigen/Dense>
 
+#include <mutex>
+
 using namespace Eigen;
 
 using Verts = Matrix<float, Dynamic, 3, RowMajor>;
@@ -19,7 +21,7 @@ class cuBVHImpl : public cuBVH {
 public:
 
     // accept numpy array (cpu) to init 
-    cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles) : cuBVH() {
+    cuBVHImpl(Ref<const Verts> vertices, Ref<const Trigs> triangles, bool upload_now) : cuBVH() {
 
         const size_t n_vertices = vertices.rows();
         const size_t n_triangles = triangles.rows();
@@ -36,11 +38,65 @@ public:
 
         triangle_bvh->build(triangles_cpu, 8);
 
-        triangles_gpu.resize_and_copy_from_host(triangles_cpu);
+        // Spellcast3D: the build above runs on the CPU only (the nodes and the reordered triangles stay in
+        // host vectors); the card copy is made here when asked for, otherwise by upload() or the first query.
+        if (upload_now) {
+            ensure_on_device();
+        }
 
         // TODO: need OPTIX
         // triangle_bvh->build_optix(triangles_gpu, m_inference_stream);
 
+    }
+
+    // Spellcast3D: the card copy is made from the host vectors, which stay as they are, so it can be dropped
+    // and made again without building the tree again. The copies are plain cudaMalloc + cudaMemcpy on the
+    // calling thread's current device (CUDA's primary context), with no state kept per thread, so a thread
+    // other than the one that built the tree may upload it, query it and release it.
+    void upload() override {
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ensure_on_device();
+    }
+
+    // cudaFree waits for the queued kernels that may still read the copy, as the destructor always did.
+    void release_device() override {
+        std::lock_guard<std::mutex> lock(device_mutex);
+        release_device_locked();
+    }
+
+    bool is_on_device() override {
+        std::lock_guard<std::mutex> lock(device_mutex);
+        return on_device;
+    }
+
+    // Callers hold device_mutex (or own the object alone, as the constructor does). The nodes go first and
+    // the triangles second, the order of the upstream constructor. The sync at the end waits for the copies
+    // to land: a copy from pageable memory may return before its DMA has finished, and a query on a stream
+    // that does not wait for the default stream would then read a half-written tree. A failed upload (out
+    // of card memory, typically) gives back what it had taken before it rethrows.
+    void ensure_on_device() {
+        if (on_device) {
+            return;
+        }
+        try {
+            triangle_bvh->upload();
+            triangles_gpu.resize_and_copy_from_host(triangles_cpu);
+            CUDA_CHECK_THROW(cudaStreamSynchronize(0));
+        } catch (...) {
+            try {
+                release_device_locked();
+            } catch (...) {
+            }
+            throw;
+        }
+        on_device = true;
+    }
+
+    // resize(0) rather than free_memory(), for the reason given in TriangleBvh::release_device().
+    void release_device_locked() {
+        on_device = false;
+        triangle_bvh->release_device();
+        triangles_gpu.resize(0);
     }
 
     void ray_trace(at::Tensor rays_o, at::Tensor rays_d, at::Tensor positions, at::Tensor face_id, at::Tensor depth) {
@@ -48,6 +104,8 @@ public:
         const uint32_t n_elements = rays_o.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ensure_on_device();
         triangle_bvh->ray_trace_gpu(n_elements, rays_o.data_ptr<float>(), rays_d.data_ptr<float>(), positions.data_ptr<float>(), face_id.data_ptr<int64_t>(), depth.data_ptr<float>(), triangles_gpu.data(), stream);
     }
 
@@ -56,6 +114,8 @@ public:
         const uint32_t n_elements = positions.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ensure_on_device();
         triangle_bvh->unsigned_distance_gpu(n_elements, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
 
     }
@@ -65,16 +125,23 @@ public:
         const uint32_t n_elements = positions.size(0);
         cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ensure_on_device();
         triangle_bvh->signed_distance_gpu(n_elements, mode, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
     }
 
     std::vector<Triangle> triangles_cpu;
     GPUMemory<Triangle> triangles_gpu;
     std::shared_ptr<TriangleBvh> triangle_bvh;
+    // Spellcast3D: whether the card holds the tree now, and the lock that keeps upload(), release_device()
+    // and the queries from interleaving when Python threads call them on one object (upload and release
+    // run without the GIL). Nothing done under the lock needs the GIL, so the two locks cannot deadlock.
+    bool on_device = false;
+    std::mutex device_mutex;
 };
     
-cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles) {
-    return new cuBVHImpl{vertices, triangles};
+cuBVH* create_cuBVH(Ref<const Verts> vertices, Ref<const Trigs> triangles, bool upload) {
+    return new cuBVHImpl{vertices, triangles, upload};
 }
 
 at::Tensor floodfill(at::Tensor grid) {

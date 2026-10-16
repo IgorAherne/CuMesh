@@ -598,7 +598,8 @@ public:
             thread_bvh(0, -1);
         }
 
-        m_nodes_gpu.resize_and_copy_from_host(m_nodes);
+        // Spellcast3D: no upload here, so that the build makes no CUDA call and a worker thread can run it
+        // while the GPU is busy; the owner calls upload() when it wants the nodes on the card.
 
         // std::cout << "[INFO] Built TriangleBvh: nodes=" << m_nodes.size() << std::endl;
     }
