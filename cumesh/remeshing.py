@@ -115,61 +115,38 @@ def remesh_narrow_band_dc(
     pbar = tqdm(total=int(torch.log2(torch.tensor(resolution // base_resolution)).item()) + 1, 
                 desc="Building Sparse Grid", disable=not verbose)
 
-    BVH_CHUNK = 2_000_000  # Max points per BVH query
-
-    def _chunked_bvh_udf(bvh, pts):
-        """Run BVH unsigned_distance in chunks to limit internal buffer peak."""
-        if pts.shape[0] <= BVH_CHUNK:
-            return bvh.unsigned_distance(pts)[0]
-        out = torch.empty(pts.shape[0], device=pts.device, dtype=torch.float32)
-        for j in range(0, pts.shape[0], BVH_CHUNK):
-            out[j:j+BVH_CHUNK] = bvh.unsigned_distance(pts[j:j+BVH_CHUNK])[0]
-        return out
-
-    # --- First iteration: filter the initial coarse grid ---
-    cell_size = scale / base_resolution
-    pts = ((coords.float() + 0.5) / base_resolution - 0.5) * scale + center
-    distances = _chunked_bvh_udf(bvh, pts)
-    del pts
-    distances -= eps
-    distances = torch.abs(distances)
-    subdiv_mask = distances < 0.87 * cell_size
-    del distances
-    coords = coords[subdiv_mask]
-    del subdiv_mask
-    pbar.update(1)
-
-    # --- Subsequent iterations: fused expand + filter in chunks ---
-    # Instead of expanding ALL parents to 8× children (memory bomb),
-    # process PARENT_CHUNK parents at a time: expand → BVH → filter → keep.
-    # Caps peak at PARENT_CHUNK*8 coords instead of N_parents*8.
-    PARENT_CHUNK = 500_000  # 500K parents → 4M children → ~112MB peak per chunk
-
-    while base_resolution < resolution:
-        base_resolution *= 2
+    while True:
+        # Calculate UDF for current voxels - chunk BVH queries to limit peak allocation
         cell_size = scale / base_resolution
-        coords_doubled = coords * 2
-        del coords
-        torch.cuda.empty_cache()
+        pts = ((coords.float() + 0.5) / base_resolution - 0.5) * scale + center
+        
+        BVH_CHUNK = 2_000_000  # Process 2M points at a time
+        if pts.shape[0] <= BVH_CHUNK:
+            distances = bvh.unsigned_distance(pts)[0]
+        else:
+            distances = torch.empty(pts.shape[0], device=device, dtype=torch.float32)
+            for i in range(0, pts.shape[0], BVH_CHUNK):
+                distances[i:i+BVH_CHUNK] = bvh.unsigned_distance(pts[i:i+BVH_CHUNK])[0]
+        del pts
+        distances -= eps
+        distances = torch.abs(distances) # Keep positive for refinement check
+        
+        # Determine which voxels are near the surface (Narrow Band)
+        # 0.87 is approx sqrt(3)/2, covering the diagonal radius of a voxel
+        subdiv_mask = distances < 0.87 * cell_size
+        del distances
+        coords = coords[subdiv_mask]
+        del subdiv_mask
 
-        surviving = []
-        for i in range(0, coords_doubled.shape[0], PARENT_CHUNK):
-            chunk_parents = coords_doubled[i:i+PARENT_CHUNK]
-            children = (chunk_parents.unsqueeze(1) + OFFSETS.unsqueeze(0)).reshape(-1, 3)
-            pts = ((children.float() + 0.5) / base_resolution - 0.5) * scale + center
-            dists = _chunked_bvh_udf(bvh, pts)
-            del pts
-            dists -= eps
-            dists = dists.abs()
-            mask = dists < 0.87 * cell_size
-            del dists
-            surviving.append(children[mask])
-            del children, mask
-        del coords_doubled
-        torch.cuda.empty_cache()
-
-        coords = torch.cat(surviving, dim=0)
-        del surviving
+        if base_resolution >= resolution:
+            break
+            
+        # Subdivide
+        base_resolution *= 2
+        coords *= 2
+        # Expand 1 voxel to 8 children
+        coords = coords.unsqueeze(1) + OFFSETS.unsqueeze(0) # (N, 8, 3)
+        coords = coords.reshape(-1, 3)
         pbar.update(1)
 
     # -------------------------------------------------------------------------
