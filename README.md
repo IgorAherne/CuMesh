@@ -1,18 +1,32 @@
-To build a whl for Trellis do:
+To build a whl for Trellis (and Spellcast3D's Pixal3D) do:
 
-- open the `x64 Native Tools Command Prompt`
+- open the `x64 Native Tools Command Prompt for VS 2022`
 - navigate to the folder of Trellis and activate its `.venv`.
-- confirm that venv already has pytorch 2.8 installed inside the venv.
+- confirm that venv already has pytorch 2.8 installed inside the venv (`2.8.0+cu128`).
 - install the wheel: `pip install wheel`
 - confirm your python version is 3.11 (`python --version`)
 - jump back to this CuMesh repo folder.
-- pull additional dependencies `git submodule update --init --recursive`
+- pull additional dependencies `git submodule update --init --recursive` (eigen, the only submodule now: cubvh is part of this repository, see below)
 - point towards your cuda toolkit (watchout for the number at the end) `set CUDA_HOME=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8`
 - and also do (watchout for the number at the end) `set PATH=C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.8\bin;%PATH%`
-- make it work with older cards (GTX 980) and newer ones, including RTX 5090: `set TORCH_CUDA_ARCH_LIST=5.2 6.1 7.5 8.0 8.6 8.9 9.0+PTX`
-- also toggle this: `set DISTUTILS_USE_SDK=1`
+- make it work with older cards (GTX 10xx) and newer ones, including RTX 5090: `set TORCH_CUDA_ARCH_LIST=6.1;7.0;7.5;8.0;8.6;8.9;9.0;10.0;12.0+PTX` (add `5.2` in front for a GTX 9xx: CUDA 12.8 still builds it)
+- also toggle this: `set DISTUTILS_USE_SDK=1` (and `set MAX_JOBS=8` if the build runs out of memory)
 - build the wheel `pip wheel . --no-build-isolation -w dist`
 - you now will have your `.whl` file inside `dist` folder. Users can install it via `pip install` and it will work on the gpu cards specified above.
+
+Spellcast3D builds its wheel the same way in one command, from a `git archive` of a pinned commit of this branch (a
+throw-away build venv, nothing installed): `code\release\wheels\cumesh\build_cumesh_win.bat --src <this clone>` in
+the Spellcast3D repository, which also lists the CUDA architectures of the result with cuobjdump. Its
+`patch_cumesh_win.py check` holds this branch's tree to upstream + the changes below, file by file.
+
+What this fork changes (branch `spellcast3d`: JeffreyXiang/CuMesh main merged, then one commit each):
+
+- the version: `0.0.1.post4+cu128torch2.8` (pip installs a wheel over an installed one only when its version is greater), and no `torch` pin in pyproject.toml (pip would replace a cu128 torch with PyPI's);
+- cubvh is vendored in `third_party/cubvh` (JeffreyXiang/cubvh at ce92267, the commit upstream pins) instead of a submodule, with eigen as this repository's submodule;
+- cuBVH builds its tree without Python's lock, and can build it in RAM alone: `cuBVH(vertices, faces, upload=False)`, then `upload()`, `release_device()`, `on_device` (the queries upload when needed);
+- cuBVH's ray-stab inside test (`signed_distance(mode="raystab")`) with an any-hit traversal: the same verdicts bit for bit, 28-48 % of the card time;
+- `fill_holes`' chain (get_edges ... fill_holes) in less card memory: 66-67 bytes a face at its widest moment instead of 141-144, the same tables bit for bit;
+- `remesh_narrow_band_dc` queries the BVH in chunks of two million points and frees its intermediates early (the same remesh).
 
 Original repo description:
 
