@@ -21,7 +21,7 @@ the Spellcast3D repository, which also lists the CUDA architectures of the resul
 
 What this fork changes (branch `spellcast3d`: JeffreyXiang/CuMesh main merged, then one commit each):
 
-- the version: `0.0.1.post4+cu128torch2.8` (pip installs a wheel over an installed one only when its version is greater), and no `torch` pin in pyproject.toml (pip would replace a cu128 torch with PyPI's);
+- the version: `0.0.1.post5+cu128torch2.8` (pip installs a wheel over an installed one only when its version is greater), and no `torch` pin in pyproject.toml (pip would replace a cu128 torch with PyPI's);
 - cubvh is vendored in `third_party/cubvh` (JeffreyXiang/cubvh at ce92267, the commit upstream pins) instead of a submodule, with eigen as this repository's submodule;
 - cuBVH builds its tree without Python's lock, and can build it in RAM alone: `cuBVH(vertices, faces, upload=False)`, then `upload()`, `release_device()`, `on_device` (the queries upload when needed);
 - cuBVH's ray-stab inside test (`signed_distance(mode="raystab")`) with an any-hit traversal: the same verdicts bit for bit, 28-48 % of the card time;

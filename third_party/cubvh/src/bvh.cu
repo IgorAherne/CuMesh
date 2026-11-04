@@ -7,6 +7,10 @@
 #include <stack>
 #include <iostream>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <thread>
+#include <unordered_map>
 
 using namespace Eigen;
 
@@ -601,84 +605,220 @@ public:
 
     }
 
-    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
-        m_nodes.clear();
+    // Spellcast3D: the tree built on several threads, the same tree the one-thread build makes, byte for byte.
+    //
+    // The one-thread build (build_range below, the original algorithm) takes a node off a stack, partitions its
+    // triangles into BRANCHING_FACTOR children with nth_element (in place, within the node's own range), gives the
+    // children the next node indices, and pushes the internal ones, so the last child's whole subtree is built
+    // before the one before it. Two facts make the parallel build exact: a subtree only ever touches its own
+    // triangle range (nth_element calls on disjoint ranges are the same calls whatever the thread), and the
+    // number of nodes a subtree gets is a function of its triangle count alone (every split is at n/2), so every
+    // node index is known before the subtree is built. build_subtree partitions a node as the one-thread build
+    // would, computes each child's node count, hands each child its index range in the one-thread order (the
+    // last child's descendants first) and builds the children's subtrees on threads of their own, each writing
+    // its nodes into its own slice of m_nodes and reordering its own slice of the triangles. A 32 M-triangle
+    // mesh (a Pixal3D prop at 1536) took 20 s on one core of a Ryzen 9, the card idle meanwhile.
+    //
+    // CUBVH_BUILD_THREADS=N picks the thread count (1 = the one-thread build; unset: the machine's threads, at
+    // most 64). CUBVH_BUILD_CHECK=1 (developers) builds the tree both ways and compares nodes and triangles.
 
-        // Root
-        m_nodes.emplace_back();
-        m_nodes.front().bb = BoundingBox(std::begin(triangles), std::end(triangles));
+    using TriIt = std::vector<Triangle>::iterator;
 
-        struct BuildNode {
-            int node_idx;
-            std::vector<Triangle>::iterator begin;
-            std::vector<Triangle>::iterator end;
-        };
+    struct BuildRange {
+        int node_idx;
+        TriIt begin;
+        TriIt end;
+    };
 
-        std::stack<BuildNode> build_stack;
-        build_stack.push({0, std::begin(triangles), std::end(triangles)});
-
-    while (!build_stack.empty()) {
-            const BuildNode& curr = build_stack.top();
-            size_t node_idx = curr.node_idx;
-
-            std::array<BuildNode, BRANCHING_FACTOR> children;
-            children[0].begin = curr.begin;
-            children[0].end = curr.end;
-
-            build_stack.pop();
-
-            // Partition the triangles into the children
-            int n_children = 1;
-            while (n_children < BRANCHING_FACTOR) {
-                for (int i = n_children - 1; i >= 0; --i) {
-                    auto& child = children[i];
-
-                    // Choose axis with maximum standard deviation
-                    Vector3f mean = Vector3f::Zero();
-                    for (auto it = child.begin; it != child.end; ++it) {
-                        mean += it->centroid();
-                    }
-                    mean /= (float)std::distance(child.begin, child.end);
-
-                    Vector3f var = Vector3f::Zero();
-                    for (auto it = child.begin; it != child.end; ++it) {
-                        Vector3f diff = it->centroid() - mean;
-                        var += diff.cwiseProduct(diff);
-                    }
-                    var /= (float)std::distance(child.begin, child.end);
-
-                    Vector3f::Index axis;
-                    var.maxCoeff(&axis);
-
-                    auto m = child.begin + std::distance(child.begin, child.end)/2;
-                    std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
-
-                    children[i*2].begin = children[i].begin;
-                    children[i*2+1].end = children[i].end;
-                    children[i*2].end = children[i*2+1].begin = m;
-                }
-
-                n_children *= 2;
-            }
-
-            // Create next build nodes
-            m_nodes[node_idx].left_idx = (int)m_nodes.size();
-            for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+    // The partition of a node's triangles into its children: the original code, unchanged.
+    static void split_range(const BuildRange& curr, std::array<BuildRange, BRANCHING_FACTOR>& children) {
+        children[0].begin = curr.begin;
+        children[0].end = curr.end;
+        int n_children = 1;
+        while (n_children < BRANCHING_FACTOR) {
+            for (int i = n_children - 1; i >= 0; --i) {
                 auto& child = children[i];
-                assert(child.begin != child.end);
-                child.node_idx = (int)m_nodes.size();
 
-                m_nodes.emplace_back();
-                m_nodes.back().bb = BoundingBox(child.begin, child.end);
-
-                if (std::distance(child.begin, child.end) <= n_primitives_per_leaf) {
-                    m_nodes.back().left_idx = -(int)std::distance(std::begin(triangles), child.begin)-1;
-                    m_nodes.back().right_idx = -(int)std::distance(std::begin(triangles), child.end)-1;
-                } else {
-                    build_stack.push(child);
+                // Choose axis with maximum standard deviation
+                Vector3f mean = Vector3f::Zero();
+                for (auto it = child.begin; it != child.end; ++it) {
+                    mean += it->centroid();
                 }
+                mean /= (float)std::distance(child.begin, child.end);
+
+                Vector3f var = Vector3f::Zero();
+                for (auto it = child.begin; it != child.end; ++it) {
+                    Vector3f diff = it->centroid() - mean;
+                    var += diff.cwiseProduct(diff);
+                }
+                var /= (float)std::distance(child.begin, child.end);
+
+                Vector3f::Index axis;
+                var.maxCoeff(&axis);
+
+                auto m = child.begin + std::distance(child.begin, child.end)/2;
+                std::nth_element(child.begin, m, child.end, [&](const Triangle& tri1, const Triangle& tri2) { return tri1.centroid(axis) < tri2.centroid(axis); });
+
+                children[i*2].begin = children[i].begin;
+                children[i*2+1].end = children[i].end;
+                children[i*2].end = children[i*2+1].begin = m;
             }
-            m_nodes[node_idx].right_idx = (int)m_nodes.size();
+
+            n_children *= 2;
+        }
+    }
+
+    // The nodes of the subtree under an internal node with n triangles, that node included: the children's
+    // sizes are what split_range makes them (n/2 and n - n/2, each halved again), a leaf has at most
+    // n_primitives_per_leaf triangles.
+    static size_t subtree_nodes(size_t n, uint32_t n_primitives_per_leaf, std::unordered_map<size_t, size_t>& memo) {
+        auto found = memo.find(n);
+        if (found != memo.end()) return found->second;
+        const size_t h = n / 2, r = n - h;
+        const size_t sizes[4] = {h / 2, h - h / 2, r / 2, r - r / 2};
+        size_t total = 1;
+        for (size_t s : sizes) {
+            total += (s <= n_primitives_per_leaf) ? 1 : subtree_nodes(s, n_primitives_per_leaf, memo);
+        }
+        memo[n] = total;
+        return total;
+    }
+
+    // The children of `curr` get the node indices [next, next + BRANCHING_FACTOR); each child's bounding box,
+    // and the leaves' triangle ranges, as the one-thread build sets them. Returns the internal children.
+    static int make_children(std::vector<TriangleBvhNode>& nodes, std::vector<Triangle>& triangles,
+                             uint32_t n_primitives_per_leaf, const BuildRange& curr, size_t& next,
+                             std::array<BuildRange, BRANCHING_FACTOR>& children, bool* internal) {
+        nodes[curr.node_idx].left_idx = (int)next;
+        int n_internal = 0;
+        for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+            auto& child = children[i];
+            assert(child.begin != child.end);
+            child.node_idx = (int)next;
+            TriangleBvhNode& node = nodes[next++];
+            node.bb = BoundingBox(child.begin, child.end);
+            if (std::distance(child.begin, child.end) <= n_primitives_per_leaf) {
+                node.left_idx = -(int)std::distance(triangles.begin(), child.begin)-1;
+                node.right_idx = -(int)std::distance(triangles.begin(), child.end)-1;
+                internal[i] = false;
+            } else {
+                internal[i] = true;
+                ++n_internal;
+            }
+        }
+        nodes[curr.node_idx].right_idx = (int)next;
+        return n_internal;
+    }
+
+    // The one-thread build of everything under the ranges on the stack, its nodes written from index `next` on.
+    static void build_range(std::vector<TriangleBvhNode>& nodes, std::vector<Triangle>& triangles,
+                            uint32_t n_primitives_per_leaf, std::stack<BuildRange>& build_stack, size_t next) {
+        while (!build_stack.empty()) {
+            const BuildRange curr = build_stack.top();
+            build_stack.pop();
+            std::array<BuildRange, BRANCHING_FACTOR> children;
+            split_range(curr, children);
+            bool internal[BRANCHING_FACTOR];
+            make_children(nodes, triangles, n_primitives_per_leaf, curr, next, children, internal);
+            for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+                if (internal[i]) build_stack.push(children[i]);
+            }
+        }
+    }
+
+    // The subtree under `curr` (an internal node whose slot is set already), its nodes from `next` on, with up
+    // to `threads` threads: the node's children are built on threads of their own, each child's descendants in
+    // the index range the one-thread build would give them.
+    static void build_subtree(std::vector<TriangleBvhNode>& nodes, std::vector<Triangle>& triangles,
+                              uint32_t n_primitives_per_leaf, const BuildRange& curr, size_t next, int threads) {
+        const size_t n = (size_t)std::distance(curr.begin, curr.end);
+        if (threads <= 1 || n < 4 * MIN_TRIANGLES_PER_THREAD) {
+            std::stack<BuildRange> build_stack;
+            build_stack.push(curr);
+            build_range(nodes, triangles, n_primitives_per_leaf, build_stack, next);
+            return;
+        }
+        std::array<BuildRange, BRANCHING_FACTOR> children;
+        split_range(curr, children);
+        bool internal[BRANCHING_FACTOR];
+        make_children(nodes, triangles, n_primitives_per_leaf, curr, next, children, internal);
+
+        // the one-thread build takes the last child off its stack first, so its descendants come first
+        std::unordered_map<size_t, size_t> memo;
+        size_t descendants[BRANCHING_FACTOR];
+        size_t total = 0;
+        for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+            const size_t count = (size_t)std::distance(children[i].begin, children[i].end);
+            descendants[i] = internal[i] ? subtree_nodes(count, n_primitives_per_leaf, memo) - 1 : 0;
+            total += descendants[i];
+        }
+        size_t offset[BRANCHING_FACTOR];
+        size_t at = next;
+        for (int i = (int)BRANCHING_FACTOR - 1; i >= 0; --i) {
+            offset[i] = at;
+            at += descendants[i];
+        }
+
+        std::vector<std::thread> workers;
+        for (uint32_t i = 0; i < BRANCHING_FACTOR; ++i) {
+            if (!internal[i]) continue;
+            // the threads shared by the children in proportion to their work, one at least
+            int share = (int)((threads * descendants[i] + total / 2) / (total ? total : 1));
+            if (share < 1) share = 1;
+            const BuildRange child = children[i];
+            workers.emplace_back([&nodes, &triangles, n_primitives_per_leaf, child, off = offset[i], share]() {
+                build_subtree(nodes, triangles, n_primitives_per_leaf, child, off, share);
+            });
+        }
+        for (auto& worker : workers) worker.join();
+    }
+
+    static constexpr size_t MIN_TRIANGLES_PER_THREAD = 65536;
+
+    static int build_threads() {
+        const char* env = std::getenv("CUBVH_BUILD_THREADS");
+        if (env && *env) {
+            const int asked = std::atoi(env);
+            if (asked >= 1) return asked > 256 ? 256 : asked;
+        }
+        const unsigned hardware = std::thread::hardware_concurrency();
+        return hardware == 0 ? 1 : (hardware > 64 ? 64 : (int)hardware);
+    }
+
+    // The nodes of the tree over `triangles` (reordered in place), with `threads` threads.
+    static void build_tree(std::vector<TriangleBvhNode>& nodes, std::vector<Triangle>& triangles,
+                           uint32_t n_primitives_per_leaf, int threads) {
+        std::unordered_map<size_t, size_t> memo;
+        nodes.clear();
+        nodes.resize(subtree_nodes(triangles.size(), n_primitives_per_leaf, memo));
+        nodes.front().bb = BoundingBox(std::begin(triangles), std::end(triangles));
+        BuildRange root{0, std::begin(triangles), std::end(triangles)};
+        build_subtree(nodes, triangles, n_primitives_per_leaf, root, 1, threads);
+    }
+
+    void build(std::vector<Triangle>& triangles, uint32_t n_primitives_per_leaf) override {
+        const int threads = build_threads();
+        const char* check = std::getenv("CUBVH_BUILD_CHECK");
+        if (check && *check && *check != '0' && threads > 1) {
+            // developers: the one-thread tree, then the parallel one, compared node by node and triangle by triangle
+            std::vector<Triangle> copy = triangles;
+            std::vector<TriangleBvhNode> single;
+            build_tree(single, copy, n_primitives_per_leaf, 1);
+            build_tree(m_nodes, triangles, n_primitives_per_leaf, threads);
+            const bool same_nodes = single.size() == m_nodes.size() &&
+                std::memcmp(single.data(), m_nodes.data(), single.size() * sizeof(TriangleBvhNode)) == 0;
+            // field by field: a Triangle has padding bytes, which a copy leaves undefined
+            bool same_triangles = copy.size() == triangles.size();
+            for (size_t i = 0; same_triangles && i < copy.size(); ++i) {
+                same_triangles = copy[i].id == triangles[i].id && copy[i].a == triangles[i].a &&
+                                 copy[i].b == triangles[i].b && copy[i].c == triangles[i].c;
+            }
+            std::cout << "[cubvh] build check: " << threads << " threads against 1: nodes "
+                      << (same_nodes ? "identical" : "DIFFERENT") << ", triangles "
+                      << (same_triangles ? "identical" : "DIFFERENT") << " (" << m_nodes.size() << " nodes, "
+                      << triangles.size() << " triangles)" << std::endl;
+        } else {
+            build_tree(m_nodes, triangles, n_primitives_per_leaf, threads);
         }
 
         // Thread the BVH with escape links for stackless traversal.
