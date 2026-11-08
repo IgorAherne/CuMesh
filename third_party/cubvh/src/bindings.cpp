@@ -18,6 +18,7 @@ py::class_<cuBVH>(m, "cuBVH")
     .def("ray_trace", &cuBVH::ray_trace)
     .def("unsigned_distance", &cuBVH::unsigned_distance)
     .def("signed_distance", &cuBVH::signed_distance)
+    .def("raystab_hits", &cuBVH::raystab_hits)
     // Spellcast3D: the card copy on demand. upload and release_device touch no Python object; without the
     // GIL other threads run while the copy is made or while cudaFree waits for queued kernels.
     .def("upload", &cuBVH::upload, py::call_guard<py::gil_scoped_release>())

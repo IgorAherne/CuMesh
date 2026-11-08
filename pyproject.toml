@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cumesh"
-version = "0.0.1.post5+cu128torch2.8"
+version = "0.0.1.post6+cu128torch2.8"
 description = "Cuda mesh utils"
 requires-python = ">=3.8"
 readme = "README.md"

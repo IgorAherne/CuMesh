@@ -130,6 +130,16 @@ public:
         triangle_bvh->signed_distance_gpu(n_elements, mode, positions.data_ptr<float>(), distances.data_ptr<float>(), face_id.data_ptr<int64_t>(), uvw.has_value() ? uvw.value().data_ptr<float>() : nullptr, triangles_gpu.data(), stream);
     }
 
+    void raystab_hits(at::Tensor positions, at::optional<at::Tensor> rng_index, at::Tensor hits, uint32_t first_ray, uint32_t last_ray, bool closest) {
+
+        const uint32_t n_elements = positions.size(0);
+        cudaStream_t stream = at::cuda::getCurrentCUDAStream();
+
+        std::lock_guard<std::mutex> lock(device_mutex);
+        ensure_on_device();
+        triangle_bvh->raystab_hits_gpu(n_elements, positions.data_ptr<float>(), rng_index.has_value() ? rng_index.value().data_ptr<int32_t>() : nullptr, first_ray, last_ray, closest, hits.data_ptr<bool>(), triangles_gpu.data(), stream);
+    }
+
     std::vector<Triangle> triangles_cpu;
     GPUMemory<Triangle> triangles_gpu;
     std::shared_ptr<TriangleBvh> triangle_bvh;

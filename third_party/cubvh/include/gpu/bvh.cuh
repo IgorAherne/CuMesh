@@ -70,6 +70,8 @@ public:
     virtual void signed_distance_gpu(uint32_t n_elements, uint32_t mode, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
     virtual void unsigned_distance_gpu(uint32_t n_elements, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
     virtual void ray_trace_gpu(uint32_t n_elements, const float* rays_o, const float* rays_d, float* positions, int64_t* face_id, float* depth, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
+    // Spellcast3D: the raystab signed distance's inside test for a subset of a call's points (bvh.cu, raystab_hits)
+    virtual void raystab_hits_gpu(uint32_t n_elements, const float* positions, const int32_t* rng_index, uint32_t first_ray, uint32_t last_ray, bool closest, bool* hits, const Triangle* gpu_triangles, cudaStream_t stream) = 0;
 
     // KIUI: not supported now.
     // virtual bool touches_triangle(const BoundingBox& bb, const Triangle* __restrict__ triangles) const = 0;

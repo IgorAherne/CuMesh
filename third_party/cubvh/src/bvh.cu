@@ -25,6 +25,7 @@ __global__ void signed_distance_watertight_kernel(uint32_t n_elements, const Vec
 __global__ void signed_distance_raystab_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
 __global__ void unsigned_distance_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
 __global__ void raytrace_kernel(uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d, Vector3f* __restrict__ positions, int64_t* __restrict__ face_id, float* __restrict__ depth, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
+__global__ void raystab_hits_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, const int32_t* __restrict__ rng_index, uint32_t first_ray, uint32_t last_ray, bool closest, bool* __restrict__ hits, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles);
 
 struct DistAndIdx {
     float dist;
@@ -534,6 +535,51 @@ public:
         return {res.first, -res.second};
     }
 
+    // Spellcast3D: signed_distance_raystab's inside test alone, for any subset of the points of a call and any
+    // range [first_ray, last_ray) of its stab directions. `rng` is seeded as the raystab kernel seeds it (from the
+    // point's index in the call it stands for), so direction i is the same direction, and each ray's hit or miss
+    // is a function of the point, the direction and the tree alone (ray_intersect_any, see above): whether some
+    // ray of the range escapes is the answer signed_distance_raystab's loop gives over those directions, in
+    // whatever range or order they are asked. With `closest`, a point whose rays all hit is then tested as
+    // signed_distance_raystab tests it, by its distance to the nearest triangle (-distance < 0: a point on the
+    // surface is not inside), so the whole range answers signed_distance_raystab(...).second < 0 bit for bit and
+    // the nearest-triangle search runs only for the points whose rays all hit. True for a point whose rays of
+    // the range all hit (and, with closest, that lies off the surface).
+    __host__ __device__ static bool raystab_hits(const Vector3f& point, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, uint32_t first_ray, uint32_t last_ray, bool closest, float max_distance_sq = MAX_DIST_SQ, pcg32 rng={}) {
+        Vector2f offset = {rng.next_float(), rng.next_float()};
+
+        static constexpr uint32_t N_STAB_RAYS = 32;     // signed_distance_raystab's
+        if (last_ray > N_STAB_RAYS) {
+            last_ray = N_STAB_RAYS;
+        }
+        for (uint32_t i = first_ray; i < last_ray; ++i) {
+            Vector3f d = fibonacci_dir<N_STAB_RAYS>(i, offset);
+            if (!ray_intersect_any(point, -d, bvhnodes, triangles) || !ray_intersect_any(point, d, bvhnodes, triangles)) {
+                return false;
+            }
+        }
+
+        if (closest) {
+            auto res = closest_triangle(point, bvhnodes, triangles, max_distance_sq);
+            return -res.second < 0.0f;
+        }
+        return true;
+    }
+
+    void raystab_hits_gpu(uint32_t n_elements, const float* positions, const int32_t* rng_index, uint32_t first_ray, uint32_t last_ray, bool closest, bool* hits, const Triangle* gpu_triangles, cudaStream_t stream) override {
+        linear_kernel(raystab_hits_kernel, 0u, stream,
+            n_elements,
+            (const Vector3f*)positions,
+            rng_index,
+            first_ray,
+            last_ray,
+            closest,
+            hits,
+            m_nodes_gpu.data(),
+            gpu_triangles
+        );
+    }
+
 
     void signed_distance_gpu(uint32_t n_elements, uint32_t mode, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) override {
 
@@ -911,6 +957,28 @@ __global__ void signed_distance_raystab_kernel(
         // query uvw
         uvw[i] = triangles[res.first].barycentric(cpoint);
     }
+}
+
+// Spellcast3D: TriangleBvh4::raystab_hits for each point. rng_index (may be null: the point's index here) is the
+// point's index in the signed_distance call it stands for, which seeds its stab directions' random offset there
+// as signed_distance_raystab_kernel seeds it (rng.advance(i * 2) on a uint32 index), and the nearest-triangle
+// search has that kernel's bound (max_distance*max_distance, max_distance = MAX_DIST).
+__global__ void raystab_hits_kernel(
+    uint32_t n_elements, const Vector3f* __restrict__ positions, const int32_t* __restrict__ rng_index,
+    uint32_t first_ray, uint32_t last_ray, bool closest, bool* __restrict__ hits,
+    const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+
+    uint32_t seed_index = rng_index ? (uint32_t)rng_index[i] : i;
+    float max_distance = MAX_DIST;
+    pcg32 rng;
+    rng.advance(seed_index * 2);
+
+    Vector3f point = positions[i];
+
+    hits[i] = TriangleBvh4::raystab_hits(point, bvhnodes, triangles, first_ray, last_ray, closest, max_distance*max_distance, rng);
 }
 
 __global__ void unsigned_distance_kernel(
