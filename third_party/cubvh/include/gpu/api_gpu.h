@@ -26,6 +26,9 @@ public:
     // Spellcast3D: signed_distance(mode raystab)'s inside test alone, per point (hits: bool), over the stab
     // directions [first_ray, last_ray), each point's directions seeded from rng_index (int32; none: its index
     // here); with closest, a point whose rays all hit is also held off the surface (bvh.cu, raystab_hits).
+    // Spellcast3D: whether each ray hits the mesh at all (hits: bool) - ray_trace's face_id >= 0 for the same
+    // ray, without the search for the nearest hit after the first.
+    virtual void ray_hits(at::Tensor rays_o, at::Tensor rays_d, at::Tensor hits) = 0;
     virtual void raystab_hits(at::Tensor positions, at::optional<at::Tensor> rng_index, at::Tensor hits, uint32_t first_ray, uint32_t last_ray, bool closest) = 0;
 
     // Spellcast3D: the card copy of the tree (nodes and triangles) on demand. upload() makes it when it is

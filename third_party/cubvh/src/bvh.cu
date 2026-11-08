@@ -26,6 +26,7 @@ __global__ void signed_distance_raystab_kernel(uint32_t n_elements, const Vector
 __global__ void unsigned_distance_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, float* __restrict__ distances, int64_t* __restrict__ face_id, Vector3f* __restrict__ uvw, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles, bool use_existing_distances_as_upper_bounds);
 __global__ void raytrace_kernel(uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d, Vector3f* __restrict__ positions, int64_t* __restrict__ face_id, float* __restrict__ depth, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
 __global__ void raystab_hits_kernel(uint32_t n_elements, const Vector3f* __restrict__ positions, const int32_t* __restrict__ rng_index, uint32_t first_ray, uint32_t last_ray, bool closest, bool* __restrict__ hits, const TriangleBvhNode* __restrict__ bvhnodes, const Triangle* __restrict__ triangles);
+__global__ void ray_hits_kernel(uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d, bool* __restrict__ hits, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles);
 
 struct DistAndIdx {
     float dist;
@@ -581,6 +582,17 @@ public:
     }
 
 
+    void ray_hits_gpu(uint32_t n_elements, const float* rays_o, const float* rays_d, bool* hits, const Triangle* gpu_triangles, cudaStream_t stream) override {
+        linear_kernel(ray_hits_kernel, 0u, stream,
+            n_elements,
+            (const Vector3f*)rays_o,
+            (const Vector3f*)rays_d,
+            hits,
+            m_nodes_gpu.data(),
+            gpu_triangles
+        );
+    }
+
     void signed_distance_gpu(uint32_t n_elements, uint32_t mode, const float* positions, float* distances, int64_t* face_id, float* uvw, const Triangle* gpu_triangles, cudaStream_t stream) override {
 
         const Vector3f* positions_vec = (const Vector3f*)positions;
@@ -1006,6 +1018,22 @@ __global__ void unsigned_distance_kernel(
         // query uvw
         uvw[i] = triangles[res.first].barycentric(cpoint);
     }
+}
+
+// Spellcast3D: whether each ray hits the mesh at all - ray_trace's face_id >= 0 for the same ray, bit for bit
+// (ray_intersect_any: the same triangle and box tests as ray_intersect, see above), without the search for the
+// nearest hit after the first.
+__global__ void ray_hits_kernel(
+    uint32_t n_elements, const Vector3f* __restrict__ rays_o, const Vector3f* __restrict__ rays_d,
+    bool* __restrict__ hits, const TriangleBvhNode* __restrict__ nodes, const Triangle* __restrict__ triangles
+) {
+    uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n_elements) return;
+
+    Vector3f ro = rays_o[i];
+    Vector3f rd = rays_d[i];
+
+    hits[i] = TriangleBvh4::ray_intersect_any(ro, rd, nodes, triangles);
 }
 
 __global__ void raytrace_kernel(

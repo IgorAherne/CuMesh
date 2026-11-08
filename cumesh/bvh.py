@@ -69,6 +69,30 @@ class cuBVH():
 
         return positions, face_id, depth
 
+    def ray_hits(self, rays_o, rays_d):
+        # Spellcast3D: whether each ray hits the mesh at all, as a bool: ray_trace(rays_o, rays_d)[1] >= 0 for the
+        # same rays, bit for bit, by a traversal that stops at the first hit instead of searching for the nearest.
+        # rays_o: torch.Tensor, float, [N, 3]
+        # rays_d: torch.Tensor, float, [N, 3]
+
+        rays_o = rays_o.float().contiguous()
+        rays_d = rays_d.float().contiguous()
+
+        if not rays_o.is_cuda: rays_o = rays_o.cuda()
+        if not rays_d.is_cuda: rays_d = rays_d.cuda()
+
+        prefix = rays_o.shape[:-1]
+        rays_o = rays_o.view(-1, 3)
+        rays_d = rays_d.view(-1, 3)
+
+        N = rays_o.shape[0]
+
+        hits = torch.empty(N, dtype=torch.bool, device=rays_o.device)
+        if N > 0:
+            self.impl.ray_hits(rays_o, rays_d, hits)
+
+        return hits.view(*prefix)
+
     def unsigned_distance(self, positions, return_uvw=False):
         # positions: torch.Tensor, float, [N, 3]
 
